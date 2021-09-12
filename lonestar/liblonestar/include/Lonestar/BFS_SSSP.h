@@ -28,8 +28,8 @@ struct BFS_SSSP {
 
   using Dist = _DistLabel;
 
-  constexpr static const Dist DIST_INFINITY =
-      std::numeric_limits<Dist>::max() / 2 - 1;
+  constexpr static const Dist DIST_INFINITY = {
+      std::numeric_limits<SSSP_Data::dist_t>::max(), 0};
 
   using GNode = typename Graph::GraphNode;
   using EI    = typename Graph::edge_iterator;
@@ -48,12 +48,11 @@ struct BFS_SSSP {
   };
 
   struct UpdateRequestIndexer {
-    unsigned shift;
+    float delta;
 
     template <typename R>
     unsigned int operator()(const R& req) const {
-      unsigned int t = req.dist >> shift;
-      return t;
+      return req.dist / delta;
     }
   };
 
@@ -189,8 +188,8 @@ struct BFS_SSSP {
     }
 
     template <bool useWt, typename iiTy>
-    Dist getEdgeWeight(iiTy ii,
-                       typename std::enable_if<useWt>::type* = nullptr) const {
+    float getEdgeWeight(iiTy ii,
+                        typename std::enable_if<useWt>::type* = nullptr) const {
       return g.getEdgeData(ii);
     }
 
@@ -202,11 +201,11 @@ struct BFS_SSSP {
       for (auto ii : g.edges(node)) {
         auto dst = g.getEdgeDst(ii);
         Dist dd  = g.getData(dst);
-        Dist ew  = getEdgeWeight<USE_EDGE_WT>(ii);
-        if (dd > sd + ew) {
+        float ew = getEdgeWeight<USE_EDGE_WT>(ii);
+        if (dd.dist > sd.dist + ew) {
           std::cout << "Wrong label: " << dd << ", on node: " << dst
                     << ", correct label from src node " << node << " is "
-                    << sd + ew << "\n"; // XXX
+                    << sd.dist + ew << "\n"; // XXX
           refb = true;
           // return;
         }
@@ -229,7 +228,7 @@ struct BFS_SSSP {
   };
 
   static bool verify(Graph& graph, GNode source) {
-    if (graph.getData(source) != 0) {
+    if (SSSP_Data(graph.getData(source)) != SSSP_Data{0, 0}) {
       std::cerr << "ERROR: source has non-zero dist value == "
                 << graph.getData(source) << std::endl;
       return false;
@@ -237,7 +236,7 @@ struct BFS_SSSP {
 
     std::atomic<size_t> notVisited(0);
     galois::do_all(galois::iterate(graph), [&notVisited, &graph](GNode node) {
-      if (graph.getData(node) >= DIST_INFINITY)
+      if (SSSP_Data(graph.getData(node)) >= DIST_INFINITY)
         ++notVisited;
     });
 

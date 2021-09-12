@@ -17,6 +17,8 @@
  * Documentation, or loss or inaccuracy of data of any kind.
  */
 
+#include "SSSP.h"
+
 #include "galois/Galois.h"
 #include "galois/AtomicHelpers.h"
 #include "galois/Reduction.h"
@@ -50,10 +52,9 @@ static cll::opt<unsigned int>
     reportNode("reportNode",
                cll::desc("Node to report distance to(default value 1)"),
                cll::init(1));
-static cll::opt<unsigned int>
-    stepShift("delta",
-              cll::desc("Shift value for the deltastep (default value 13)"),
-              cll::init(13));
+static cll::opt<float>
+    delta("delta", cll::desc("Delta for delta-stepping (default value 1.0F)"),
+          cll::init(1.0F));
 
 enum Algo {
   deltaTile = 0,
@@ -88,16 +89,16 @@ static cll::opt<Algo> algo(
     cll::init(AutoAlgo));
 
 //! [withnumaalloc]
-using Graph = galois::graphs::LC_CSR_Graph<std::atomic<uint32_t>, uint32_t>::
+using Graph = galois::graphs::LC_CSR_Graph<std::atomic<SSSP_Data>, float>::
     with_no_lockable<true>::type ::with_numa_alloc<true>::type;
 //! [withnumaalloc]
 typedef Graph::GraphNode GNode;
 
-constexpr static const bool TRACK_WORK          = false;
+constexpr static const bool TRACK_WORK          = true;
 constexpr static const unsigned CHUNK_SIZE      = 64U;
 constexpr static const ptrdiff_t EDGE_TILE_SIZE = 512;
 
-using SSSP                 = BFS_SSSP<Graph, uint32_t, true, EDGE_TILE_SIZE>;
+using SSSP                 = BFS_SSSP<Graph, SSSP_Data, true, EDGE_TILE_SIZE>;
 using Dist                 = SSSP::Dist;
 using UpdateRequest        = SSSP::UpdateRequest;
 using UpdateRequestIndexer = SSSP::UpdateRequestIndexer;
@@ -123,17 +124,18 @@ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
   galois::GAccumulator<size_t> BadWork;
   //! [reducible for self-defined stats]
   galois::GAccumulator<size_t> WLEmptyWork;
+  galois::GAccumulator<size_t> WORK_COUNT;
 
-  graph.getData(source) = 0;
+  graph.getData(source) = {0.F, source};
 
   galois::InsertBag<T> initBag;
-  pushWrap(initBag, source, 0, "parallel");
+  pushWrap(initBag, source, {0.F, source}, "parallel");
 
   galois::for_each(
       galois::iterate(initBag),
       [&](const T& item, auto& ctx) {
         constexpr galois::MethodFlag flag = galois::MethodFlag::UNPROTECTED;
-        const auto& sdata                 = graph.getData(item.src, flag);
+        const SSSP_Data sdata             = graph.getData(item.src, flag);
 
         if (sdata < item.dist) {
           if (TRACK_WORK)
@@ -142,12 +144,13 @@ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
         }
 
         for (auto ii : edgeRange(item)) {
+          WORK_COUNT += 1;
 
           GNode dst          = graph.getEdgeDst(ii);
           auto& ddist        = graph.getData(dst, flag);
-          Dist ew            = graph.getEdgeData(ii, flag);
-          const Dist newDist = sdata + ew;
-          Dist oldDist       = galois::atomicMin<uint32_t>(ddist, newDist);
+          auto ew            = graph.getEdgeData(ii, flag);
+          const Dist newDist = sdata + SSSP_Data{ew, item.src};
+          Dist oldDist       = galois::atomicMin<SSSP_Data>(ddist, newDist);
           if (newDist < oldDist) {
             if (TRACK_WORK) {
               //! [per-thread contribution of self-defined stats]
@@ -160,7 +163,7 @@ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
           }
         }
       },
-      galois::wl<OBIMTy>(UpdateRequestIndexer{stepShift}),
+      galois::wl<OBIMTy>(UpdateRequestIndexer{delta}),
       galois::disable_conflict_detection(), galois::loopname("SSSP"));
 
   if (TRACK_WORK) {
@@ -169,9 +172,13 @@ void deltaStepAlgo(Graph& graph, GNode source, const P& pushWrap,
     //! [report self-defined stats]
     galois::runtime::reportStat_Single("SSSP", "WLEmptyWork",
                                        WLEmptyWork.reduce());
+    //! [report self-defined stats]
+    galois::runtime::reportStat_Single("SSSP", "WORK_COUNT",
+                                       WORK_COUNT.reduce());
   }
 }
 
+/*
 template <typename T, typename P, typename R>
 void serDeltaAlgo(Graph& graph, const GNode& source, const P& pushWrap,
                   const R& edgeRange) {
@@ -351,6 +358,7 @@ void topoTileAlgo(Graph& graph, const GNode& source) {
 
   galois::runtime::reportStat_Single("SSSP-topo", "rounds", rounds);
 }
+*/
 
 int main(int argc, char** argv) {
   galois::SharedMemSys G;
@@ -389,7 +397,7 @@ int main(int argc, char** argv) {
 
   if (algo == deltaStep || algo == deltaTile || algo == serDelta ||
       algo == serDeltaTile) {
-    std::cout << "INFO: Using delta-step of " << (1 << stepShift) << "\n";
+    std::cout << "INFO: Using delta-step of " << delta << "\n";
     std::cout
         << "WARNING: Performance varies considerably due to delta parameter.\n";
     std::cout
@@ -399,7 +407,7 @@ int main(int argc, char** argv) {
   galois::do_all(galois::iterate(graph),
                  [&graph](GNode n) { graph.getData(n) = SSSP::DIST_INFINITY; });
 
-  graph.getData(source) = 0;
+  graph.getData(source) = {0, source};
 
   std::cout << "Running " << ALGO_NAMES[algo] << " algorithm\n";
 
@@ -419,36 +427,40 @@ int main(int argc, char** argv) {
   }
 
   switch (algo) {
+  /*
   case deltaTile:
     deltaStepAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
                                TileRangeFn());
     break;
+  */
   case deltaStep:
     deltaStepAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
                                  OutEdgeRangeFn{graph});
     break;
-  case serDeltaTile:
-    serDeltaAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
-                              TileRangeFn());
-    break;
-  case serDelta:
-    serDeltaAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
-                                OutEdgeRangeFn{graph});
-    break;
-  case dijkstraTile:
-    dijkstraAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
-                              TileRangeFn());
-    break;
-  case dijkstra:
-    dijkstraAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
-                                OutEdgeRangeFn{graph});
-    break;
-  case topo:
-    topoAlgo(graph, source);
-    break;
-  case topoTile:
-    topoTileAlgo(graph, source);
-    break;
+    /*
+    case serDeltaTile:
+      serDeltaAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
+                                TileRangeFn());
+      break;
+    case serDelta:
+      serDeltaAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
+                                  OutEdgeRangeFn{graph});
+      break;
+    case dijkstraTile:
+      dijkstraAlgo<SrcEdgeTile>(graph, source, SrcEdgeTilePushWrap{graph},
+                                TileRangeFn());
+      break;
+    case dijkstra:
+      dijkstraAlgo<UpdateRequest>(graph, source, ReqPushWrap(),
+                                  OutEdgeRangeFn{graph});
+      break;
+    case topo:
+      topoAlgo(graph, source);
+      break;
+    case topoTile:
+      topoTileAlgo(graph, source);
+      break;
+    */
 
   case deltaStepBarrier:
     deltaStepAlgo<UpdateRequest, OBIM_Barrier>(graph, source, ReqPushWrap(),
@@ -467,9 +479,9 @@ int main(int argc, char** argv) {
             << graph.getData(report) << "\n";
 
   // Sanity checking code
-  galois::GReduceMax<uint64_t> maxDistance;
-  galois::GAccumulator<uint64_t> distanceSum;
-  galois::GAccumulator<uint32_t> visitedNode;
+  galois::GReduceMax<float> maxDistance;
+  galois::GAccumulator<float> distanceSum;
+  galois::GAccumulator<float> visitedNode;
   maxDistance.reset();
   distanceSum.reset();
   visitedNode.reset();
@@ -477,20 +489,20 @@ int main(int argc, char** argv) {
   galois::do_all(
       galois::iterate(graph),
       [&](uint64_t i) {
-        uint32_t myDistance = graph.getData(i);
+        const SSSP_Data myDistance = graph.getData(i);
 
         if (myDistance != SSSP::DIST_INFINITY) {
-          maxDistance.update(myDistance);
-          distanceSum += myDistance;
+          maxDistance.update(myDistance.dist);
+          distanceSum += myDistance.dist;
           visitedNode += 1;
         }
       },
       galois::loopname("Sanity check"), galois::no_stats());
 
   // report sanity stats
-  uint64_t rMaxDistance = maxDistance.reduce();
-  uint64_t rDistanceSum = distanceSum.reduce();
-  uint64_t rVisitedNode = visitedNode.reduce();
+  float rMaxDistance = maxDistance.reduce();
+  float rDistanceSum = distanceSum.reduce();
+  float rVisitedNode = visitedNode.reduce();
   galois::gInfo("# visited nodes is ", rVisitedNode);
   galois::gInfo("Max distance is ", rMaxDistance);
   galois::gInfo("Sum of visited distances is ", rDistanceSum);
